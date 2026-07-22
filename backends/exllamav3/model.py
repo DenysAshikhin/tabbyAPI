@@ -22,7 +22,7 @@ from exllamav3 import (
     Tokenizer,
 )
 from exllamav3.cache import CacheLayer_quant
-from backends.exllamav3.grammar import ExLlamaV3Grammar
+from backends.exllamav3.grammar import ExLlamaV3Grammar, schema_filter_cache
 
 from backends.exllamav3.sampler import ExllamaV3SamplerBuilder
 from backends.exllamav3.utils import exllama_supports_nccl
@@ -738,6 +738,9 @@ class ExllamaV3Container:
 
             # Clear the image embedding cache
             clear_image_embedding_cache()
+
+            # Grammar automata are compiled against this model's vocabulary
+            schema_filter_cache.clear()
 
             self.model.unload()
             self.model = None
