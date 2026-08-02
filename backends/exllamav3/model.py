@@ -128,6 +128,8 @@ class ExllamaV3Container:
     chunk_size: int = 2048
     max_rq_tokens: Optional[int] = 2048
     max_batch_size: Optional[int] = None
+    draft_mode: str = "model"
+    draft_model_name: Optional[str] = None
     draft_num_tokens: Optional[int] = None
     draft_dynamic: bool = False
     ngram_match_min: int = 0
@@ -139,6 +141,40 @@ class ExllamaV3Container:
         self.load_lock = asyncio.Lock()
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
+
+    def configure_drafting(self, draft_args: Dict[str, Any]):
+        """
+        Resolves every drafting knob from the draft_model config section. Pure with respect to
+        model and device state, so it is exercisable without loading a model.
+        """
+
+        self.draft_mode = unwrap(draft_args.get("draft_mode"), "model")
+        if self.draft_mode not in {"model", "disabled", "mtp", "ngram"}:
+            raise ValueError(f"Unknown exllamav3 draft mode: {self.draft_mode}")
+        self.draft_model_name = draft_args.get("draft_model_name")
+        self.use_draft_model = self.draft_mode == "mtp" or (
+            self.draft_mode == "model" and bool(self.draft_model_name)
+        )
+        self.ngram_match_min = (
+            unwrap(draft_args.get("ngram_match_min"), 2) if self.draft_mode == "ngram" else 0
+        )
+        if self.draft_mode == "ngram" and self.ngram_match_min <= 0:
+            raise ValueError("ngram_match_min must be greater than 0 for n-gram drafting")
+        self.draft_num_tokens = (
+            draft_args.get("draft_num_tokens")
+            if self.use_draft_model or self.ngram_match_min
+            else None
+        )
+        self.draft_dynamic = (
+            unwrap(draft_args.get("draft_dynamic"), False) if self.use_draft_model else False
+        )
+
+        # Always disable draft if params are incorrectly configured
+        if self.draft_mode == "model" and draft_args and self.draft_model_name is None:
+            xlogger.warning(
+                "Draft model is disabled because a model name "
+                "wasn't provided. Please check your config.yml!"
+            )
 
     # Required methods
     @classmethod
@@ -199,44 +235,18 @@ class ExllamaV3Container:
 
         # Prepare the draft model config if necessary
         draft_args = unwrap(kwargs.get("draft_model"), {})
-        draft_mode = unwrap(draft_args.get("draft_mode"), "model")
-        if draft_mode not in {"model", "disabled", "mtp", "ngram"}:
-            raise ValueError(f"Unknown exllamav3 draft mode: {draft_mode}")
-        draft_model_name = draft_args.get("draft_model_name")
-        self.use_draft_model = draft_mode == "mtp" or (
-            draft_mode == "model" and bool(draft_model_name)
-        )
-        self.ngram_match_min = (
-            unwrap(draft_args.get("ngram_match_min"), 2) if draft_mode == "ngram" else 0
-        )
-        if draft_mode == "ngram" and self.ngram_match_min <= 0:
-            raise ValueError("ngram_match_min must be greater than 0 for n-gram drafting")
-        self.draft_num_tokens = (
-            draft_args.get("draft_num_tokens")
-            if self.use_draft_model or self.ngram_match_min
-            else None
-        )
-        self.draft_dynamic = (
-            unwrap(draft_args.get("draft_dynamic"), False) if self.use_draft_model else False
-        )
-
-        # Always disable draft if params are incorrectly configured
-        if draft_mode == "model" and draft_args and draft_model_name is None:
-            xlogger.warning(
-                "Draft model is disabled because a model name "
-                "wasn't provided. Please check your config.yml!"
-            )
+        self.configure_drafting(draft_args)
 
         if self.use_draft_model:
             self.draft_gpu_split = unwrap(draft_args.get("draft_gpu_split"), [])
-            if draft_mode == "mtp":
+            if self.draft_mode == "mtp":
                 self.draft_model_dir = self.model_dir
                 self.draft_config = self.config
                 self.draft_model = Model.from_config(self.draft_config, component="mtp")
                 xlogger.info("Using main model MTP component for drafting")
             else:
                 draft_model_path = pathlib.Path(unwrap(draft_args.get("draft_model_dir"), "models"))
-                draft_model_path = draft_model_path / draft_model_name
+                draft_model_path = draft_model_path / self.draft_model_name
                 self.draft_model_dir = draft_model_path
                 self.draft_config = Config.from_directory(str(draft_model_path.resolve()))
                 self.draft_model = Model.from_config(self.draft_config)
