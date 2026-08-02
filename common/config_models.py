@@ -446,6 +446,13 @@ class DraftModelConfig(BaseConfigModel):
             "(e.g. DFlash with 15 tokens by default) shorter drafts may be preferable."
         ),
     )
+    draft_dynamic: Optional[bool] = Field(
+        False,
+        description=(
+            "Adapt the draft window per job from its acceptance EMA (default: False).\n"
+            "draft_num_tokens acts as the ceiling. exllamav3 only."
+        ),
+    )
     ngram_match_min: Optional[int] = Field(
         2,
         description=(
@@ -531,6 +538,13 @@ class MemoryConfig(BaseConfigModel):
     sysmem_recurrent_cache: Optional[int] = Field(
         4096,
         description=("Max size of recurrent cache in system memory, in MB (default: 4096)"),
+    )
+    sysmem_page_cache: Optional[int] = Field(
+        0,
+        description=(
+            "Size of the second-tier K/V page cache in pinned system memory, in MB\n"
+            "(default: 0 = disabled). exllamav3 only; unsupported with tensor parallel."
+        ),
     )
     cuda_malloc_async: Optional[bool] = Field(
         True,

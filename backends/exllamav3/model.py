@@ -129,6 +129,7 @@ class ExllamaV3Container:
     max_rq_tokens: Optional[int] = 2048
     max_batch_size: Optional[int] = None
     draft_num_tokens: Optional[int] = None
+    draft_dynamic: bool = False
     ngram_match_min: int = 0
 
     def __init__(self):
@@ -214,6 +215,9 @@ class ExllamaV3Container:
             draft_args.get("draft_num_tokens")
             if self.use_draft_model or self.ngram_match_min
             else None
+        )
+        self.draft_dynamic = (
+            unwrap(draft_args.get("draft_dynamic"), False) if self.use_draft_model else False
         )
 
         # Always disable draft if params are incorrectly configured
@@ -697,6 +701,8 @@ class ExllamaV3Container:
                 max_chunk_size=self.chunk_size,
                 recurrent_cache_size=config.memory.sysmem_recurrent_cache * 1024**2,
                 num_draft_tokens=self.draft_num_tokens,
+                dynamic_draft_tokens=self.draft_dynamic,
+                cpu_cache_size=unwrap(config.memory.sysmem_page_cache, 0) * 1024**2,
                 ngram_match_min=self.ngram_match_min,
             )
 
