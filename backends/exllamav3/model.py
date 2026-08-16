@@ -141,6 +141,7 @@ class ExllamaV3Container:
         self.load_lock = asyncio.Lock()
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
+        self.frozen_sources = None
 
     def configure_drafting(self, draft_args: Dict[str, Any]):
         """
@@ -648,46 +649,66 @@ class ExllamaV3Container:
             async with self.load_condition:
                 self.load_condition.notify_all()
 
+    def _component_inventory(self):
+        """Return present model components in vision, draft, main order."""
+        components = []
+        if self.vision_model is not None:
+            components.append(("vision", self.vision_model))
+        if self.draft_model is not None:
+            components.append(("draft", self.draft_model))
+        if self.model is None:
+            raise RuntimeError("Main model is unavailable.")
+        components.append(("main", self.model))
+        return tuple(components)
+
     @torch.inference_mode()
-    def load_model_sync(self, progress_callback=None):
-        if self.use_vision:
-            for value in self.vision_model.load_gen(
-                reserve_per_device=self.autosplit_reserve,
-                use_per_device=self.gpu_split or None,
-                callback=progress_callback,
-            ):
+    def load_model_sync(self, progress_callback=None, sources=None, loaded_models=None):
+        def load_component(name, model, **kwargs):
+            if sources is not None:
+                if name not in sources:
+                    raise RuntimeError(f"Missing RAM-resident source for {name} model.")
+                kwargs = {
+                    "callback": progress_callback,
+                    "source": sources[name],
+                    "device": "cuda:0",
+                }
+            else:
+                kwargs["callback"] = progress_callback
+            if loaded_models is not None:
+                loaded_models.append(model)
+            for value in model.load_gen(**kwargs):
                 if value:
                     yield value
 
-        if self.use_draft_model:
-            for value in self.draft_model.load_gen(
-                reserve_per_device=self.autosplit_reserve,
-                use_per_device=self.draft_gpu_split or None,
-                callback=progress_callback,
-            ):
-                if value:
-                    yield value
+        component_kwargs = {
+            "vision": {
+                "reserve_per_device": self.autosplit_reserve,
+                "use_per_device": self.gpu_split or None,
+            },
+            "draft": {
+                "reserve_per_device": self.autosplit_reserve,
+                "use_per_device": self.draft_gpu_split or None,
+            },
+            "main": {
+                "tensor_p": self.use_tp,
+                "tp_backend": self.tp_backend,
+                "reserve_per_device": self.autosplit_reserve,
+                "use_per_device": self.gpu_split,
+                "max_chunk_size": self.chunk_size,
+                "max_batch_size": self.max_batch_size,
+            },
+        }
+        for name, model in self._component_inventory():
+            if name == "main":
+                xlogger.info("Loading model: " + str(self.model_dir))
 
-        xlogger.info("Loading model: " + str(self.model_dir))
-
-        if self.use_tp:
-            xlogger.info("Loading with tensor parallel")
-        elif self.gpu_split_auto:
-            xlogger.info("Loading with autosplit")
-        else:
-            xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
-
-        for value in self.model.load_gen(
-            tensor_p=self.use_tp,
-            tp_backend=self.tp_backend,
-            reserve_per_device=self.autosplit_reserve,
-            use_per_device=self.gpu_split,
-            callback=progress_callback,
-            max_chunk_size=self.chunk_size,
-            max_batch_size=self.max_batch_size,
-        ):
-            if value:
-                yield value
+                if self.use_tp:
+                    xlogger.info("Loading with tensor parallel")
+                elif self.gpu_split_auto:
+                    xlogger.info("Loading with autosplit")
+                else:
+                    xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
+            yield from load_component(name, model, **component_kwargs[name])
 
     async def create_generator(self):
         """Create and save a Exllama generator class."""
@@ -742,53 +763,226 @@ class ExllamaV3Container:
             xlogger.error("LoRA unloading is not hooked up to the ExLlamaV3 backend yet.")
             return
 
-        # Used when shutting down the server
-        do_shutdown = kwargs.get("shutdown")
-
         try:
-            if not do_shutdown:
-                await self.load_lock.acquire()
+            async with self.load_lock:
+                first_error = None
+                try:
+                    await self.wait_for_jobs(kwargs.get("skip_wait"))
+                except BaseException as ex:
+                    first_error = ex
 
-                # Wait for other jobs to finish
-                await self.wait_for_jobs(kwargs.get("skip_wait"))
+                try:
+                    components = self._component_inventory() if self.model is not None else ()
+                except BaseException as ex:
+                    components = ()
+                    if first_error is None:
+                        first_error = ex
 
-            # Clear the image embedding cache
-            clear_image_embedding_cache()
+                generator = self.generator
+                self.generator = None
+                if generator is not None:
+                    try:
+                        await generator.close()
+                    except BaseException as ex:
+                        if first_error is None:
+                            first_error = ex
 
-            # Grammar automata are compiled against this model's vocabulary
-            schema_filter_cache.clear()
+                caches = (self.cache, self.draft_cache)
+                self.cache = None
+                self.draft_cache = None
+                for _, model in reversed(components):
+                    try:
+                        model.unload()
+                    except BaseException as ex:
+                        if first_error is None:
+                            first_error = ex
 
-            self.model.unload()
-            self.model = None
-            self.config = None
-            self.cache = None
-            self.tokenizer = None
+                for cache in caches:
+                    if cache is not None:
+                        try:
+                            cache.detach_from_model()
+                        except BaseException as ex:
+                            if first_error is None:
+                                first_error = ex
 
-            if self.use_draft_model:
-                self.draft_model.unload()
+                try:
+                    clear_image_embedding_cache()
+                except BaseException as ex:
+                    if first_error is None:
+                        first_error = ex
+                try:
+                    schema_filter_cache.clear()
+                except BaseException as ex:
+                    if first_error is None:
+                        first_error = ex
+
+                self.model = None
+                self.config = None
+                self.cache = None
+                self.tokenizer = None
+                self.hf_model = None
                 self.draft_model = None
                 self.draft_config = None
                 self.draft_cache = None
-
-            if self.use_vision:
-                self.vision_model.unload()
                 self.vision_model = None
-
-            # Cleanup the generator from any pending jobs
-            if self.generator is not None:
-                await self.generator.close()
                 self.generator = None
+                self.frozen_sources = None
+                self.loaded = False
 
-            gc.collect()
-            torch.cuda.empty_cache()
+                try:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                except BaseException as ex:
+                    if first_error is None:
+                        first_error = ex
 
-            xlogger.info("Model unloaded.")
+                if first_error is not None:
+                    raise first_error
+                xlogger.info("Model unloaded.")
         finally:
-            if not do_shutdown:
-                self.load_lock.release()
+            async with self.load_condition:
+                self.load_condition.notify_all()
 
-                async with self.load_condition:
-                    self.load_condition.notify_all()
+    async def freeze_to_ram(self, **kwargs):
+        """Freeze weights in host RAM and free VRAM while keeping model objects alive."""
+        try:
+            async with self.load_lock:
+                await self.wait_for_jobs(kwargs.get("skip_wait"))
+
+                components = self._component_inventory()
+                if self.frozen_sources is None:
+                    sources = {}
+                    for name, model in components:
+                        source = model.freeze()
+                        if source is None:
+                            raise RuntimeError(f"Missing frozen source for {name} model.")
+                        sources[name] = source
+                    self.frozen_sources = sources
+                self.loaded = False
+
+                generator = self.generator
+                self.generator = None
+                caches = (self.cache, self.draft_cache)
+                self.cache = None
+                self.draft_cache = None
+                first_error = None
+
+                if generator is not None:
+                    try:
+                        await generator.close()
+                    except BaseException as ex:
+                        first_error = ex
+
+                for _, model in components:
+                    try:
+                        model.unload()
+                    except BaseException as ex:
+                        if first_error is None:
+                            first_error = ex
+
+                for cache in caches:
+                    if cache is not None:
+                        try:
+                            cache.detach_from_model()
+                        except BaseException as ex:
+                            if first_error is None:
+                                first_error = ex
+
+                try:
+                    clear_image_embedding_cache()
+                except BaseException as ex:
+                    if first_error is None:
+                        first_error = ex
+                try:
+                    schema_filter_cache.clear()
+                except BaseException as ex:
+                    if first_error is None:
+                        first_error = ex
+                try:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                except BaseException as ex:
+                    if first_error is None:
+                        first_error = ex
+
+                if first_error is not None:
+                    raise first_error
+                xlogger.info("Model frozen to system RAM.")
+        finally:
+            async with self.load_condition:
+                self.load_condition.notify_all()
+
+    async def restore_from_freeze(self, **kwargs):
+        """Restore frozen weights to the device without reading from disk."""
+        try:
+            async with self.load_lock:
+                new_cache = None
+                new_draft_cache = None
+                previous_cache = self.cache
+                previous_draft_cache = self.draft_cache
+                previous_max_batch_size = self.max_batch_size
+                components = ()
+                if self.frozen_sources is None:
+                    raise RuntimeError("No frozen weights to restore.")
+                try:
+                    components = self._component_inventory()
+                    expected_names = {name for name, _ in components}
+                    sources = self.frozen_sources
+                    if (
+                        set(sources) != expected_names
+                        or any(sources[name] is None for name in expected_names)
+                    ):
+                        raise RuntimeError("Frozen source set does not exactly match model inventory.")
+
+                    await self.wait_for_jobs(kwargs.get("skip_wait"))
+                    component_models = dict(components)
+                    new_cache = self.create_cache(self.cache_mode, component_models["main"])
+                    if "draft" in component_models:
+                        new_draft_cache = self.create_cache(
+                            self.draft_cache_mode, component_models["draft"]
+                        )
+                    self.cache = new_cache
+                    self.draft_cache = new_draft_cache
+
+                    for _ in self.load_model_sync(None, sources):
+                        pass
+                    await self.create_generator()
+
+                    self.loaded = True
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    xlogger.info("Model restored from system RAM.")
+                    self.frozen_sources = None
+                except BaseException:
+                    generator = self.generator
+                    self.generator = None
+                    if generator is not None:
+                        try:
+                            await generator.close()
+                        except BaseException as ex:
+                            xlogger.error("Failed to close generator after restore failure.", ex)
+
+                    for _, model in components:
+                        try:
+                            model.unload()
+                        except BaseException as ex:
+                            xlogger.error("Failed to unload model after restore failure.", ex)
+
+                    for cache in (new_cache, new_draft_cache):
+                        if cache is not None:
+                            try:
+                                cache.detach_from_model()
+                            except BaseException as ex:
+                                xlogger.error("Failed to detach cache after restore failure.", ex)
+
+                    self.cache = previous_cache
+                    self.draft_cache = previous_draft_cache
+                    self.loaded = False
+                    self.max_batch_size = previous_max_batch_size
+                    raise
+        finally:
+            async with self.load_condition:
+                self.load_condition.notify_all()
 
     def encode_tokens(self, text: str, **kwargs) -> List[int]:
         """

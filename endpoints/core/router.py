@@ -213,6 +213,22 @@ async def unload_model():
     await model.unload_model(skip_wait=True)
 
 
+@router.post(
+    "/v1/model/freeze",
+    dependencies=[Depends(check_admin_key), Depends(check_model_container)],
+)
+async def freeze_model():
+    await model.freeze_model_to_ram(skip_wait=True)
+
+
+@router.post(
+    "/v1/model/restore",
+    dependencies=[Depends(check_admin_key), Depends(check_model_container)],
+)
+async def restore_model():
+    await model.restore_frozen_model()
+
+
 @router.post("/v1/download", dependencies=[Depends(check_admin_key)])
 async def download_model(request: Request, data: DownloadRequest) -> DownloadResponse:
     """Downloads a model from HuggingFace."""

@@ -136,6 +136,18 @@ async def unload_model(skip_wait: bool = False, shutdown: bool = False):
     container = None
 
 
+async def freeze_model_to_ram(skip_wait: bool = False):
+    if container is None:
+        raise RuntimeError("No model is available to freeze.")
+    await container.freeze_to_ram(skip_wait=skip_wait)
+
+
+async def restore_frozen_model():
+    if container is None:
+        raise RuntimeError("No frozen model is available to restore.")
+    await container.restore_from_freeze()
+
+
 async def load_model_gen(model_path: pathlib.Path, **kwargs):
     """Generator to load a model"""
     global container
