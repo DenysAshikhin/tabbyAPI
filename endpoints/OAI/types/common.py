@@ -12,6 +12,13 @@ class PromptTokensDetails(BaseModel):
     cached_tokens: int = 0
 
 
+class CompletionTokensDetails(BaseModel):
+    """OpenAI-style completion token details (speculative decoding accounting)."""
+
+    accepted_prediction_tokens: int = 0
+    rejected_prediction_tokens: int = 0
+
+
 class UsageStats(BaseModel):
     """Represents usage stats."""
 
@@ -20,12 +27,11 @@ class UsageStats(BaseModel):
     prompt_time: Optional[float] = None
     prompt_tokens_per_sec: Optional[Union[float, str]] = None
     completion_tokens: int
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
     completion_time: Optional[float] = None
     completion_tokens_per_sec: Optional[Union[float, str]] = None
     total_tokens: int
     total_time: Optional[float] = None
-    draft_accepted_tokens: Optional[int] = None
-    draft_rejected_tokens: Optional[int] = None
 
 
 class CompletionResponseFormat(BaseModel):
