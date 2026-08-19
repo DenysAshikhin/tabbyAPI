@@ -80,7 +80,7 @@ cu12 = [
     # exllamav3 siftkit branch with pip wheel, then install the wheel it produces.
     # An upstream wheel does not satisfy this pin, so a reinstall fails loudly instead of
     # silently removing freeze support.
-    "exllamav3 == 1.3.0+siftkit.freeze",
+    "exllamav3 == 1.4.2+siftkit.freeze",
 ]
 cu13 = [
     # Torch (Extra index URLs not support in pyproject.toml)
@@ -103,7 +103,7 @@ cu13 = [
     # exllamav3 siftkit branch with pip wheel, then install the wheel it produces.
     # An upstream wheel does not satisfy this pin, so a reinstall fails loudly instead of
     # silently removing freeze support.
-    "exllamav3 == 1.3.0+siftkit.freeze",
+    "exllamav3 == 1.4.2+siftkit.freeze",
 ]
 # MARK: Ruff options
 
