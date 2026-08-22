@@ -75,12 +75,13 @@ cu12 = [
     # Flash Linear Attention
     "flash-linear-attention >= 0.5.0 ; (platform_system == 'Linux' and platform_machine == 'x86_64') or platform_system == 'Windows'",
 
-    # Exl3 - pinned to the SiftKit fork, which carries host-RAM freeze support
-    # (Model.freeze / FrozenTensorSource) that no upstream wheel provides. Build it from the
-    # exllamav3 siftkit branch with pip wheel, then install the wheel it produces.
-    # An upstream wheel does not satisfy this pin, so a reinstall fails loudly instead of
-    # silently removing freeze support.
-    "exllamav3 == 1.4.2+siftkit.freeze2",
+    # Exl3 - pinned to the unified local tree (siftkit freeze support merged with the
+    # qbench/racefix dev branch). Editable-installed from
+    # D:\personal\models\elx3\benchmark_tools\exllamav3-dev-qbench; keep this pin in sync
+    # with exllamav3/version.py there. Upstream wheels do not provide freeze support
+    # (Model.freeze / FrozenTensorSource), so a reinstall fails loudly instead of
+    # silently removing it.
+    "exllamav3 == 1.4.2+unified.1",
 ]
 cu13 = [
     # Torch (Extra index URLs not support in pyproject.toml)
@@ -98,12 +99,13 @@ cu13 = [
     # Flash Linear Attention
     "flash-linear-attention >= 0.5.0 ; python_version >= '3.12' and ((platform_system == 'Linux' and platform_machine == 'x86_64') or platform_system == 'Windows')",
 
-    # Exl3 - pinned to the SiftKit fork, which carries host-RAM freeze support
-    # (Model.freeze / FrozenTensorSource) that no upstream wheel provides. Build it from the
-    # exllamav3 siftkit branch with pip wheel, then install the wheel it produces.
-    # An upstream wheel does not satisfy this pin, so a reinstall fails loudly instead of
-    # silently removing freeze support.
-    "exllamav3 == 1.4.2+siftkit.freeze2",
+    # Exl3 - pinned to the unified local tree (siftkit freeze support merged with the
+    # qbench/racefix dev branch). Editable-installed from
+    # D:\personal\models\elx3\benchmark_tools\exllamav3-dev-qbench; keep this pin in sync
+    # with exllamav3/version.py there. Upstream wheels do not provide freeze support
+    # (Model.freeze / FrozenTensorSource), so a reinstall fails loudly instead of
+    # silently removing it.
+    "exllamav3 == 1.4.2+unified.1",
 ]
 # MARK: Ruff options
 
