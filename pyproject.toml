@@ -26,8 +26,7 @@ dependencies = [
     "sse-starlette >= 2.2.0",
     "packaging",
     "tokenizers >= 0.21.0",
-    "formatron >= 0.4.11",
-    "kbnf >= 0.4.1",
+    "numpy",
     "aiofiles",
     "aiohttp",
     "async_lru",
@@ -52,7 +51,11 @@ dependencies = [
 extras = [
     # Heavy dependencies that aren't for everyday use
     "infinity-emb",
-    "sentence-transformers",
+    # Match the bound infinity-emb declares for its torch engine
+    "sentence-transformers < 4.0",
+    # infinity-emb uses the pre-1.0 huggingface_hub API (HfFolder) and doesn't
+    # bound it upstream. See issue #414.
+    "huggingface_hub < 1.0",
 ]
 dev = [
     "ruff == 0.11.10"
@@ -81,7 +84,7 @@ cu12 = [
     # with exllamav3/version.py there. Upstream wheels do not provide freeze support
     # (Model.freeze / FrozenTensorSource), so a reinstall fails loudly instead of
     # silently removing it.
-    "exllamav3 == 1.4.2+unified.1",
+    "exllamav3 == 1.4.4+unified.1",
 ]
 cu13 = [
     # Torch (Extra index URLs not support in pyproject.toml)
@@ -105,7 +108,7 @@ cu13 = [
     # with exllamav3/version.py there. Upstream wheels do not provide freeze support
     # (Model.freeze / FrozenTensorSource), so a reinstall fails loudly instead of
     # silently removing it.
-    "exllamav3 == 1.4.2+unified.1",
+    "exllamav3 == 1.4.4+unified.1",
 ]
 # MARK: Ruff options
 

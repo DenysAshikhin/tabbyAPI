@@ -112,6 +112,8 @@ class LoggingConfig(BaseConfigModel):
         False,
         description=(
             "Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).\n"
+            "Also saves the fully templated prompt (the exact text sent to the tokenizer) "
+            "as a .txt file with the same basename.\n"
             "PRIVACY WARNING: Enabling this creates a comprehensive request log, including the "
             "full message history and generation parameters. API keys are redacted, but prompts "
             "and user-provided content are preserved for bug-report reproduction."
@@ -242,9 +244,39 @@ class ModelConfig(BaseConfigModel):
         default_factory=list,
         description=(
             "Array of VRAM sizes to split between GPUs, in GB (default: []).\n"
-            "Used with tensor parallelism."
+            "Used both with and without tensor parallelism."
         ),
     )
+    cpu_moe_offload_layers: Optional[int] = Field(
+        0,
+        description=(
+            "Number of mixture-of-expert layers to offload to CPU inference (default: 0)\n"
+            "Only affects MoE models. Set a large value such as 999 to offload all layers\n"
+            "Mutually exclusive with cpu_moe_split_experts."
+        ),
+    )
+    cpu_moe_split_experts: Optional[int] = Field(
+        0,
+        description=(
+            "Number of routed experts per MoE layer to offload to CPU inference\n"
+            "(default: 0). Unlike cpu_moe_offload_layers, this splits every MoE\n"
+            "layer instead of offloading whole layers: the coldest experts are\n"
+            "kept in system RAM and computed on the CPU, overlapping each\n"
+            "layer's own GPU compute, with dynamic placement keeping hot\n"
+            "experts in VRAM. Mutually exclusive with cpu_moe_offload_layers;\n"
+            "not supported with tensor parallelism."
+        ),
+    )
+    cpu_moe_threads: Optional[int] = Field(
+        None,
+        description=(
+            "Worker thread count for CPU MoE inference (default: None).\n"
+            "Applies to both cpu_moe_offload_layers and cpu_moe_split_experts.\n"
+            "When unset, defers to the EXL3_MOE_CPU_THREADS environment\n"
+            "variable, then half the CPU core count."
+        ),
+    )
+
     rope_scale: Optional[float] = Field(
         1.0,
         description=(
@@ -307,6 +339,15 @@ class ModelConfig(BaseConfigModel):
         False,
         description=("Enables vision support if the model supports it. (default: False)"),
     )
+    vision_offload: Optional[bool] = Field(
+        False,
+        description=(
+            "Keep the vision model's weights in system RAM instead of VRAM\n"
+            "(default: False). Weights are stored in pinned host memory and\n"
+            "streamed to the GPU during inference, trading vision speed for\n"
+            "VRAM. Only applies when vision is enabled."
+        ),
+    )
     template_vars_default: dict = Field(
         {},
         description=(
@@ -359,6 +400,29 @@ class ModelConfig(BaseConfigModel):
             "plain reasoning text."
         ),
     )
+    reasoning_budget_tokens: Optional[int] = Field(
+        None,
+        description=(
+            "Default reasoning token budget (default: None).\n"
+            "When a request's reasoning content exceeds the budget, the server\n"
+            "forces the end of the reasoning phase by injecting\n"
+            "reasoning_budget_message followed by the model's end-of-reasoning\n"
+            "tokens. 0 ends reasoning as soon as it starts; None or a negative\n"
+            "value disables the budget. Overridable per request via\n"
+            "reasoning_budget_tokens (aliases: reasoning_budget,\n"
+            "thinking_budget, thinking_token_budget) or reasoning.max_tokens.\n"
+            "Requires a reasoning format: reasoning tags, Harmony or Muse\n"
+            "Glimmer."
+        ),
+    )
+    reasoning_budget_message: Optional[str] = Field(
+        None,
+        description=(
+            "Text injected before the end-of-reasoning tokens when the\n"
+            "reasoning budget is exhausted (default: no text, only the end-of-reasoning\n"
+            "tokens are forced). Overridable per request via reasoning_budget_message."
+        ),
+    )
     tool_format: Optional[str] = Field(
         None,
         description=(
@@ -372,6 +436,16 @@ class ModelConfig(BaseConfigModel):
             "Parse responses in the Harmony message format (gpt-oss models).\n"
             "Auto-detected from the model's special tokens by default; set to\n"
             "true or false to override. Setting 'tool_format: harmony' is\n"
+            "equivalent to setting this to true. When active, supersedes the\n"
+            "reasoning and tool format settings."
+        ),
+    )
+    muse_glimmer: Optional[bool] = Field(
+        None,
+        description=(
+            "Parse responses in the Muse Glimmer message format.\n"
+            "Auto-detected from the model's special tokens by default; set to\n"
+            "true or false to override. Setting 'tool_format: muse_glimmer' is\n"
             "equivalent to setting this to true. When active, supersedes the\n"
             "reasoning and tool format settings."
         ),
@@ -446,11 +520,11 @@ class DraftModelConfig(BaseConfigModel):
             "(e.g. DFlash with 15 tokens by default) shorter drafts may be preferable."
         ),
     )
-    draft_dynamic: Optional[bool] = Field(
+    dynamic_draft: Optional[bool] = Field(
         False,
         description=(
-            "Adapt the draft window per job from its acceptance EMA (default: False).\n"
-            "draft_num_tokens acts as the ceiling. exllamav3 only."
+            "Adjust number of draft tokens dynamically based on observed acceptance rates.\n"
+            "Ceiling is given by num_draft_tokens."
         ),
     )
     ngram_match_min: Optional[int] = Field(
@@ -539,12 +613,9 @@ class MemoryConfig(BaseConfigModel):
         4096,
         description=("Max size of recurrent cache in system memory, in MB (default: 4096)"),
     )
-    sysmem_page_cache: Optional[int] = Field(
+    sysmem_kv_cache: Optional[int] = Field(
         0,
-        description=(
-            "Size of the second-tier K/V page cache in pinned system memory, in MB\n"
-            "(default: 0 = disabled). exllamav3 only; unsupported with tensor parallel."
-        ),
+        description=("Size of system memory second-tier K/V cache, in MB (default: 0)"),
     )
     cuda_malloc_async: Optional[bool] = Field(
         True,

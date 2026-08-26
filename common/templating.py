@@ -7,11 +7,10 @@ import pathlib
 from datetime import datetime
 from importlib.metadata import version as package_version
 from typing import Optional
-from jinja2 import Template, TemplateError
-from jinja2.ext import loopcontrols
+from jinja2 import Template, TemplateError, nodes
+from jinja2.ext import Extension, loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from common.logger import xlogger
-from markupsafe import Markup
 from packaging import version
 
 
@@ -45,15 +44,32 @@ def _tojson_compat(value, indent=None, ensure_ascii=True):
 
     Some model templates call ``tojson(ensure_ascii=False)`` while the
     bundled Jinja filter may not accept that keyword in sandboxed mode.
+
+    Returns a plain string, matching the transformers template environment:
+    autoescape is off, and a Markup return value would HTML-escape any plain
+    string a template concatenates with the filter's output.
     """
-    return Markup(
-        json.dumps(
-            value,
-            indent=indent,
-            ensure_ascii=ensure_ascii,
-            separators=(",", ": "),
-        )
+    return json.dumps(
+        value,
+        indent=indent,
+        ensure_ascii=ensure_ascii,
+        separators=(",", ": "),
     )
+
+
+class _GenerationTagExtension(Extension):
+    """Render-transparent {% generation %}...{% endgeneration %} blocks.
+
+    Transformers uses these tags to mark assistant tokens for training-time
+    masking; at inference the block contents render as-is.
+    """
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.Scope(body).set_lineno(lineno)
 
 
 def _create_environment() -> ImmutableSandboxedEnvironment:
@@ -63,7 +79,7 @@ def _create_environment() -> ImmutableSandboxedEnvironment:
         trim_blocks=True,
         lstrip_blocks=True,
         enable_async=True,
-        extensions=[loopcontrols],
+        extensions=[loopcontrols, _GenerationTagExtension],
     )
     environment.globals["strftime_now"] = _strftime_now
     environment.globals["raise_exception"] = _raise_exception

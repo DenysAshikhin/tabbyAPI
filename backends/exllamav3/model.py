@@ -22,7 +22,7 @@ from exllamav3 import (
     Tokenizer,
 )
 from exllamav3.cache import CacheLayer_quant
-from backends.exllamav3.grammar import ExLlamaV3Grammar, schema_filter_cache
+from backends.exllamav3.grammar import ExLlamaV3Grammar
 
 from backends.exllamav3.sampler import ExllamaV3SamplerBuilder
 from backends.exllamav3.utils import exllama_supports_nccl
@@ -86,6 +86,9 @@ class ExllamaV3Container:
     prompt_template: Optional[PromptTemplate] = None
     tool_format: Optional[str] = None
     harmony: bool = False
+    muse_glimmer: bool = False
+    reasoning_budget_tokens: Optional[int] = None
+    reasoning_budget_message: Optional[str] = None
 
     # Optional features
     use_draft_model: bool = False
@@ -131,7 +134,7 @@ class ExllamaV3Container:
     draft_mode: str = "model"
     draft_model_name: Optional[str] = None
     draft_num_tokens: Optional[int] = None
-    draft_dynamic: bool = False
+    dynamic_draft: Optional[bool] = False
     ngram_match_min: int = 0
 
     def __init__(self):
@@ -142,40 +145,6 @@ class ExllamaV3Container:
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
         self.frozen_sources = None
-
-    def configure_drafting(self, draft_args: Dict[str, Any]):
-        """
-        Resolves every drafting knob from the draft_model config section. Pure with respect to
-        model and device state, so it is exercisable without loading a model.
-        """
-
-        self.draft_mode = unwrap(draft_args.get("draft_mode"), "model")
-        if self.draft_mode not in {"model", "disabled", "mtp", "ngram"}:
-            raise ValueError(f"Unknown exllamav3 draft mode: {self.draft_mode}")
-        self.draft_model_name = draft_args.get("draft_model_name")
-        self.use_draft_model = self.draft_mode == "mtp" or (
-            self.draft_mode == "model" and bool(self.draft_model_name)
-        )
-        self.ngram_match_min = (
-            unwrap(draft_args.get("ngram_match_min"), 2) if self.draft_mode == "ngram" else 0
-        )
-        if self.draft_mode == "ngram" and self.ngram_match_min <= 0:
-            raise ValueError("ngram_match_min must be greater than 0 for n-gram drafting")
-        self.draft_num_tokens = (
-            draft_args.get("draft_num_tokens")
-            if self.use_draft_model or self.ngram_match_min
-            else None
-        )
-        self.draft_dynamic = (
-            unwrap(draft_args.get("draft_dynamic"), False) if self.use_draft_model else False
-        )
-
-        # Always disable draft if params are incorrectly configured
-        if self.draft_mode == "model" and draft_args and self.draft_model_name is None:
-            xlogger.warning(
-                "Draft model is disabled because a model name "
-                "wasn't provided. Please check your config.yml!"
-            )
 
     # Required methods
     @classmethod
@@ -208,7 +177,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.0.0")
+        check_package_version("exllamav3", "1.4.4")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
@@ -216,12 +185,40 @@ class ExllamaV3Container:
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
 
+        # Set CPU offload layers
+        self.config.infer_params.moe_cpu_offload = unwrap(kwargs.get("cpu_moe_offload_layers"), 0)
+
+        # Per-layer expert split: the tail N routed experts of every eligible
+        # MoE layer run on the CPU, with dynamic placement keeping hot experts
+        # in VRAM
+        cpu_moe_split_experts = unwrap(kwargs.get("cpu_moe_split_experts"), 0)
+        if cpu_moe_split_experts:
+            if self.config.infer_params.moe_cpu_offload:
+                raise ValueError(
+                    "cpu_moe_split_experts and cpu_moe_offload_layers are "
+                    "mutually exclusive: the split offloads part of every MoE "
+                    "layer instead of whole layers."
+                )
+            if unwrap(kwargs.get("tensor_parallel"), False):
+                raise ValueError("cpu_moe_split_experts is not supported with tensor parallelism.")
+            self.config.infer_params.moe_cpu_split = cpu_moe_split_experts
+
+        # Worker thread count for both CPU MoE modes; None defers to the
+        # EXL3_MOE_CPU_THREADS env variable, then half the CPU core count
+        cpu_moe_threads = kwargs.get("cpu_moe_threads")
+        if cpu_moe_threads is not None:
+            self.config.infer_params.moe_cpu_threads = cpu_moe_threads
+
         # Prepare vision model if requested in config
         self.vision_model = None
         self.use_vision = kwargs.get("vision", False)
+        # Must be set before the vision component is loaded
+        self.config.infer_params.vision_pinned = unwrap(kwargs.get("vision_offload"), False)
         if self.use_vision:
             if "vision" in self.config.model_classes:
                 self.vision_model = Model.from_config(self.config, component="vision")
+                if self.config.infer_params.vision_pinned:
+                    xlogger.info("Keeping vision model weights in system RAM (vision_offload).")
             else:
                 xlogger.warning(
                     "The provided model does not have vision capabilities that are "
@@ -236,7 +233,31 @@ class ExllamaV3Container:
 
         # Prepare the draft model config if necessary
         draft_args = unwrap(kwargs.get("draft_model"), {})
-        self.configure_drafting(draft_args)
+        draft_mode = unwrap(draft_args.get("draft_mode"), "model")
+        if draft_mode not in {"model", "disabled", "mtp", "ngram"}:
+            raise ValueError(f"Unknown exllamav3 draft mode: {draft_mode}")
+        draft_model_name = draft_args.get("draft_model_name")
+        self.use_draft_model = draft_mode == "mtp" or (
+            draft_mode == "model" and bool(draft_model_name)
+        )
+        self.ngram_match_min = (
+            unwrap(draft_args.get("ngram_match_min"), 2) if draft_mode == "ngram" else 0
+        )
+        if draft_mode == "ngram" and self.ngram_match_min <= 0:
+            raise ValueError("ngram_match_min must be greater than 0 for n-gram drafting")
+        self.draft_num_tokens = (
+            draft_args.get("draft_num_tokens")
+            if self.use_draft_model or self.ngram_match_min
+            else None
+        )
+        self.dynamic_draft = draft_args.get("dynamic_draft", False)
+
+        # Always disable draft if params are incorrectly configured
+        if draft_mode == "model" and draft_args and draft_model_name is None:
+            xlogger.warning(
+                "Draft model is disabled because a model name "
+                "wasn't provided. Please check your config.yml!"
+            )
 
         if self.use_draft_model:
             self.draft_gpu_split = unwrap(draft_args.get("draft_gpu_split"), [])
@@ -415,6 +436,10 @@ class ExllamaV3Container:
         self.reasoning_end_token = kwargs.get("reasoning_end_token", "</think>")
         self.tool_calls_in_reasoning = kwargs.get("tool_calls_in_reasoning", True)
 
+        # Reasoning budget defaults, overridable per request
+        self.reasoning_budget_tokens = kwargs.get("reasoning_budget_tokens")
+        self.reasoning_budget_message = kwargs.get("reasoning_budget_message")
+
         # Default and forced chat template variables
         self.template_vars_default = kwargs.get("template_vars_default") or {}
         self.template_vars_force = kwargs.get("template_vars_force") or {}
@@ -462,6 +487,44 @@ class ExllamaV3Container:
                 xlogger.warning(
                     "Harmony supersedes the reasoning and tool format settings "
                     "in the model config; they will be ignored."
+                )
+
+        # Muse Glimmer message format. Like Harmony, the message structure is
+        # baked into the checkpoint's special tokens, so auto-detect from the
+        # tokenizer unless overridden in config. The token sets are disjoint
+        # (Glimmer has no <|channel|>, Harmony no <|eom|>/<|eot|>), so the
+        # two auto-detections cannot both trigger.
+        glimmer = kwargs.get("muse_glimmer")
+        if self.tool_format in ("muse_glimmer", "glimmer"):
+            # Glimmer isn't a tag-based tool format; selecting it as one
+            # enables full Glimmer parsing
+            if glimmer is False:
+                xlogger.warning(
+                    f"tool_format: {self.tool_format} has no effect when "
+                    "muse_glimmer is set to false; tool calls will not be parsed."
+                )
+            else:
+                glimmer = True
+        if glimmer is None:
+            glimmer = not self.harmony and all(
+                self.tokenizer.single_id(token) is not None
+                for token in ("<|start|>", "<|message|>", "<|eom|>", "<|eot|>")
+            )
+        if glimmer and self.harmony:
+            xlogger.warning(
+                "Both harmony and muse_glimmer are enabled; using Harmony "
+                "and ignoring muse_glimmer."
+            )
+            glimmer = False
+        self.muse_glimmer = bool(glimmer)
+        if self.muse_glimmer:
+            xlogger.info("Using the Muse Glimmer format for reasoning and tool call parsing.")
+            if self.reasoning or (
+                self.tool_format and self.tool_format not in ("muse_glimmer", "glimmer")
+            ):
+                xlogger.warning(
+                    "Muse Glimmer supersedes the reasoning and tool format "
+                    "settings in the model config; they will be ignored."
                 )
 
         return self
@@ -731,9 +794,9 @@ class ExllamaV3Container:
                 max_batch_size=self.max_batch_size,
                 max_chunk_size=self.chunk_size,
                 recurrent_cache_size=config.memory.sysmem_recurrent_cache * 1024**2,
+                cpu_cache_size=config.memory.sysmem_kv_cache * 1024**2,
                 num_draft_tokens=self.draft_num_tokens,
-                dynamic_draft_tokens=self.draft_dynamic,
-                cpu_cache_size=unwrap(config.memory.sysmem_page_cache, 0) * 1024**2,
+                dynamic_draft_tokens=self.dynamic_draft,
                 ngram_match_min=self.ngram_match_min,
             )
 
@@ -807,11 +870,6 @@ class ExllamaV3Container:
 
                 try:
                     clear_image_embedding_cache()
-                except BaseException as ex:
-                    if first_error is None:
-                        first_error = ex
-                try:
-                    schema_filter_cache.clear()
                 except BaseException as ex:
                     if first_error is None:
                         first_error = ex
@@ -890,11 +948,6 @@ class ExllamaV3Container:
 
                 try:
                     clear_image_embedding_cache()
-                except BaseException as ex:
-                    if first_error is None:
-                        first_error = ex
-                try:
-                    schema_filter_cache.clear()
                 except BaseException as ex:
                     if first_error is None:
                         first_error = ex
@@ -1196,6 +1249,40 @@ class ExllamaV3Container:
             # Clean up and remove the job from active IDs
             del self.active_job_ids[request_id]
 
+    def constrain_generation_output(self, request_id: str, text: str) -> bool:
+        """
+        Force `text` into the output stream of an active generation job: the
+        next sampled tokens are constrained to the given string, then sampling
+        resumes. Used to end the reasoning phase when a reasoning budget is
+        exhausted. Returns False if the job is not running or the installed
+        exllamav3 version does not support output constraints.
+        """
+
+        job = self.active_job_ids.get(request_id)
+        if job is None:
+            return False
+
+        # TODO: Call directly once the minimum exllamav3 version requirement
+        #       includes AsyncJob.constrain_output_now
+        if not hasattr(job, "constrain_output_now"):
+            xlogger.warning(
+                "The installed exllamav3 version does not support output "
+                "constraints; the reasoning budget is ignored."
+            )
+            return False
+
+        # Encode here rather than passing the string through: tokenizers with
+        # a BOS post-processor (Llama-3 style) prepend BOS regardless of
+        # add_bos, which would corrupt the injection
+        ids = self.tokenizer.encode(text, encode_special_tokens=True, add_bos=False)
+        if ids.shape[-1] > 0 and ids[0, 0].item() == self.tokenizer.bos_token_id:
+            ids = ids[:, 1:]
+        if ids.shape[-1] == 0:
+            return False
+
+        job.constrain_output_now(ids)
+        return True
+
     def handle_logprobs(self, result: dict, generation: dict):
         """
         Translate EXL3 logprobs to OAI format
@@ -1342,6 +1429,10 @@ class ExllamaV3Container:
 
         sampler_builder = ExllamaV3SamplerBuilder()
 
+        # Apply logit bias first so it lands ahead of the other steps
+        if params.logit_bias:
+            sampler_builder.logit_bias(params.logit_bias)
+
         # Penalties
 
         # Set penalty range
@@ -1373,6 +1464,10 @@ class ExllamaV3Container:
             ),  # TODO: Allow decay = 0 when exl3 kernel fix is pushed (v0.0.27)
         )
 
+        # Ban tokens
+        if params.banned_tokens:
+            sampler_builder.ban_tokens(params.banned_tokens)
+
         # Apply temperature first to builder
         if not params.temperature_last:
             sampler_builder.temperature(params.temperature)
@@ -1385,6 +1480,10 @@ class ExllamaV3Container:
         # Apply temperature last to builder
         if params.temperature_last:
             sampler_builder.temperature(params.temperature)
+
+        # Apply XTC to the final distribution
+        if params.xtc_probability > 0.0:
+            sampler_builder.xtc(params.xtc_probability, params.xtc_threshold, self.tokenizer)
 
         # Apply adaptive-P
         if params.adaptive_target < 1.0:
@@ -1483,7 +1582,7 @@ class ExllamaV3Container:
                 )
 
             if params.grammar_string:
-                grammar_handler.add_kbnf_filter(
+                grammar_handler.add_grammar_filter(
                     params.grammar_string, self.tokenizer, trigger_token_id=trigger_token_id
                 )
 

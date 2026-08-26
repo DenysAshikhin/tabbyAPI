@@ -1,6 +1,10 @@
 import unittest
 
-from endpoints.OAI.utils.stream_parser import HarmonyStreamParser, TagStreamParser
+from endpoints.OAI.utils.stream_parser import (
+    GlimmerStreamParser,
+    HarmonyStreamParser,
+    TagStreamParser,
+)
 
 
 def collect(parser, chunks):
@@ -211,6 +215,27 @@ class HarmonyStreamParserTests(unittest.TestCase):
         self.assertIn("to=functions.f", out["tool"])
         self.assertTrue(out["tool"].endswith("<|message|>{}<|call|>"))
 
+    def test_analysis_channel_tool_call(self):
+        # gpt-oss emits some tool calls on the analysis channel (the Harmony
+        # spec calls built-in tools from there); a recipient in the header
+        # marks a tool call regardless of channel
+        p = HarmonyStreamParser()
+        out = collect(
+            p,
+            [
+                "<|channel|>analysis<|message|>We need to open the file.<|end|>",
+                "<|start|>assistant<|channel|>analysis to=functions.read code",
+                '<|message|>{"filePath": "index.html"}',
+            ],
+        )
+        self.assertEqual(out["reasoning"], "We need to open the file.")
+        self.assertEqual(out["content"], "")
+        self.assertEqual(
+            out["tool"],
+            "assistant<|channel|>analysis to=functions.read code"
+            '<|message|>{"filePath": "index.html"}<|call|>',
+        )
+
     def test_commentary_preamble_is_content(self):
         p = HarmonyStreamParser()
         out = collect(
@@ -254,6 +279,190 @@ class HarmonyStreamParserTests(unittest.TestCase):
         p = HarmonyStreamParser()
         out = collect(p, ["<|channel|>anal"])
         self.assertEqual(out, {"reasoning": "", "content": "", "tool": ""})
+
+
+class GlimmerStreamParserTests(unittest.TestCase):
+    # Generation begins after the prompt's "<|start|>assistant", so the text
+    # opens with a message header. <|eot|> is a stop token and usually never
+    # appears in the text.
+
+    def test_reasoning_then_final(self):
+        p = GlimmerStreamParser()
+        out = collect(
+            p,
+            [
+                " to=self<|message|>Let me think.",
+                "<|eom|>",
+                "<|start|>assistant to=user<|message|>",
+                "The answer is 4.",
+            ],
+        )
+        self.assertEqual(out["reasoning"], "Let me think.")
+        self.assertEqual(out["content"], "The answer is 4.")
+        self.assertEqual(out["tool"], "")
+
+    def test_no_recipient_is_content(self):
+        p = GlimmerStreamParser()
+        out = collect(p, ["<|message|>Hello."])
+        self.assertEqual(out["content"], "Hello.")
+        self.assertEqual(out["reasoning"], "")
+
+    def test_single_chunk(self):
+        p = GlimmerStreamParser()
+        out = collect(
+            p,
+            [" to=self<|message|>hmm<|eom|><|start|>assistant to=user<|message|>ok"],
+        )
+        self.assertEqual(out["reasoning"], "hmm")
+        self.assertEqual(out["content"], "ok")
+
+    def test_tool_call(self):
+        p = GlimmerStreamParser()
+        out = collect(
+            p,
+            [
+                " to=self<|message|>Need the weather.<|eom|>",
+                "<|start|>assistant to=get_weather",
+                "<|message|>",
+                "<atem:function_calls>\n",
+                '<atem:invoke name="get_weather">\n',
+                '<atem:parameter name="location">Tokyo</atem:parameter>\n',
+                "</atem:invoke>\n</atem:function_calls>",
+            ],
+        )
+        self.assertEqual(out["reasoning"], "Need the weather.")
+        self.assertEqual(out["content"], "")
+        # finish() terminates the open tool message; the header keeps the
+        # role text that followed <|start|>
+        self.assertEqual(
+            out["tool"],
+            "assistant to=get_weather<|message|><atem:function_calls>\n"
+            '<atem:invoke name="get_weather">\n'
+            '<atem:parameter name="location">Tokyo</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls><|eom|>",
+        )
+
+    def test_parallel_tool_calls(self):
+        p = GlimmerStreamParser()
+        out = collect(
+            p,
+            [
+                " to=ns.f<|message|>bodyf<|eom|>",
+                "<|start|>assistant to=ns.g<|message|>bodyg",
+            ],
+        )
+        self.assertEqual(
+            out["tool"],
+            " to=ns.f<|message|>bodyf<|eom|>assistant to=ns.g<|message|>bodyg<|eom|>",
+        )
+
+    def test_structural_token_split_across_chunks(self):
+        p = GlimmerStreamParser()
+        out = collect(
+            p,
+            [" to=self<|mess", "age|>a<|e", "om|><|start|>assistant"] + [" to=user<|message|>b"],
+        )
+        self.assertEqual(out["reasoning"], "a")
+        self.assertEqual(out["content"], "b")
+
+    def test_channel_properties_and_saw_tag(self):
+        p = GlimmerStreamParser()
+        self.assertFalse(p.in_reasoning or p.in_tool or p.in_content)
+        p.feed(" to=self<|message|>")
+        self.assertTrue(p.saw_tag)
+        self.assertTrue(p.in_reasoning)
+        p.feed("thinking")
+        self.assertFalse(p.saw_tag)
+        p.feed("<|eom|><|start|>assistant to=user<|message|>hello")
+        self.assertTrue(p.in_content)
+
+    def test_finish_without_tool_message(self):
+        p = GlimmerStreamParser()
+        p.feed(" to=user<|message|>done")
+        self.assertEqual(p.finish(), [])
+
+    def test_truncation_mid_header_discards_header(self):
+        # max_new_tokens can cut generation before <|message|>
+        p = GlimmerStreamParser()
+        out = collect(p, [" to=se"])
+        self.assertEqual(out, {"reasoning": "", "content": "", "tool": ""})
+
+
+class GlimmerToolcallFormatTests(unittest.TestCase):
+    def parse(self, text):
+        from endpoints.OAI.utils.toolcall_formats.muse_glimmer import parse_toolcalls
+
+        return parse_toolcalls(text)
+
+    def test_parse_tool_call(self):
+        calls = self.parse(
+            "assistant to=get_weather<|message|><atem:function_calls>\n"
+            '<atem:invoke name="get_weather">\n'
+            '<atem:parameter name="location">Tokyo</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls><|eom|>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "get_weather")
+        self.assertEqual(calls[0].function.arguments, '{"location": "Tokyo"}')
+
+    def test_value_types(self):
+        calls = self.parse(
+            '<atem:invoke name="f">\n'
+            '<atem:parameter name="count">3</atem:parameter>\n'
+            '<atem:parameter name="enabled">true</atem:parameter>\n'
+            '<atem:parameter name="tags">["a", "b"]</atem:parameter>\n'
+            '<atem:parameter name="opts">{"k": 1}</atem:parameter>\n'
+            '<atem:parameter name="note">plain text</atem:parameter>\n'
+            "</atem:invoke>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].function.arguments,
+            '{"count": 3, "enabled": true, "tags": ["a", "b"], '
+            '"opts": {"k": 1}, "note": "plain text"}',
+        )
+
+    def test_multiline_string_preserved(self):
+        calls = self.parse(
+            '<atem:invoke name="f">\n'
+            '<atem:parameter name="text">line one\nline two\n</atem:parameter>\n'
+            "</atem:invoke>"
+        )
+        self.assertEqual(calls[0].function.arguments, '{"text": "line one\\nline two\\n"}')
+
+    def test_parallel_calls_across_messages(self):
+        calls = self.parse(
+            " to=ns.f<|message|><atem:function_calls>\n"
+            '<atem:invoke name="ns.f">\n'
+            '<atem:parameter name="a">1</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls><|eom|>"
+            "assistant to=ns.g<|message|><atem:function_calls>\n"
+            '<atem:invoke name="ns.g">\n'
+            '<atem:parameter name="b">2</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls><|eom|>"
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].function.name, "ns.f")
+        self.assertEqual(calls[0].function.arguments, '{"a": 1}')
+        self.assertEqual(calls[1].function.name, "ns.g")
+        self.assertEqual(calls[1].function.arguments, '{"b": 2}')
+
+    def test_missing_closing_invoke_tag(self):
+        # Generation can be truncated before the closing tags
+        calls = self.parse(
+            '<atem:invoke name="f">\n<atem:parameter name="a">hello</atem:parameter>\n'
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.arguments, '{"a": "hello"}')
+
+    def test_no_args(self):
+        calls = self.parse('<atem:invoke name="list_files">\n</atem:invoke>')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "list_files")
+        self.assertEqual(calls[0].function.arguments, "{}")
+
+    def test_no_invoke_block(self):
+        self.assertEqual(self.parse(" to=ns.f<|message|>garbled<|eom|>"), [])
 
 
 class HarmonyToolcallFormatTests(unittest.TestCase):
@@ -378,6 +587,179 @@ class Hy3ToolcallFormatTests(unittest.TestCase):
         out = collect(p, [text[i : i + 7] for i in range(0, len(text), 7)])
         self.assertEqual(out["reasoning"], "pondering")
         self.assertEqual(out["content"], "Checking the weather.")
+
+        calls = self.parse(out["tool"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "get_weather")
+        self.assertEqual(calls[0].function.arguments, '{"location": "Tokyo"}')
+
+
+class LagunaToolcallFormatTests(unittest.TestCase):
+    """
+    Laguna (Poolside) uses the glm4_5 format without newlines: the function
+    name is directly followed by the first <arg_key> tag, and parallel calls
+    are back-to-back <tool_call> blocks with no outer wrapper.
+    """
+
+    def parse(self, text):
+        from endpoints.OAI.utils.toolcall_formats.glm4_5 import parse_toolcalls
+
+        return parse_toolcalls(text)
+
+    def test_compact_call_no_newlines(self):
+        calls = self.parse(
+            "<tool_call>get_weather"
+            "<arg_key>location</arg_key><arg_value>Tokyo</arg_value>"
+            "</tool_call>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "get_weather")
+        self.assertEqual(calls[0].function.arguments, '{"location": "Tokyo"}')
+
+    def test_parallel_compact_calls(self):
+        calls = self.parse(
+            "<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"
+            '<tool_call>g<arg_key>b</arg_key><arg_value>["x", "y"]</arg_value>'
+            "</tool_call>"
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].function.name, "f")
+        self.assertEqual(calls[0].function.arguments, '{"a": 1}')
+        self.assertEqual(calls[1].function.name, "g")
+        self.assertEqual(calls[1].function.arguments, '{"b": ["x", "y"]}')
+
+    def test_no_args(self):
+        calls = self.parse("<tool_call>list_files</tool_call>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "list_files")
+        self.assertEqual(calls[0].function.arguments, "{}")
+
+    def test_streamed_through_tag_parser(self):
+        p = TagStreamParser(
+            reasoning_start="<think>",
+            reasoning_end="</think>",
+            tool_start="<tool_call>",
+            tool_end="</tool_call>",
+            start_in_reasoning=True,
+        )
+        text = (
+            "pondering</think>Checking the weather."
+            "<tool_call>get_weather"
+            "<arg_key>location</arg_key><arg_value>Tokyo</arg_value>"
+            "</tool_call>"
+        )
+        out = collect(p, [text[i : i + 7] for i in range(0, len(text), 7)])
+        self.assertEqual(out["reasoning"], "pondering")
+        self.assertEqual(out["content"], "Checking the weather.")
+
+        calls = self.parse(out["tool"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "get_weather")
+        self.assertEqual(calls[0].function.arguments, '{"location": "Tokyo"}')
+
+
+class DeepseekV4ToolcallFormatTests(unittest.TestCase):
+    def parse(self, text):
+        from endpoints.OAI.utils.toolcall_formats.deepseek_v4 import parse_toolcalls
+
+        return parse_toolcalls(text)
+
+    def test_parse_tool_call(self):
+        calls = self.parse(
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="location" string="true">Paris</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "get_weather")
+        self.assertEqual(calls[0].function.arguments, '{"location": "Paris", "days": 3}')
+
+    def test_string_param_kept_verbatim(self):
+        # string="true" values are never JSON-decoded, even if they look typed
+        calls = self.parse(
+            '<｜DSML｜invoke name="f">\n'
+            '<｜DSML｜parameter name="a" string="true">123</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="b" string="true">{"x": 1}\nline two</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].function.arguments, '{"a": "123", "b": "{\\"x\\": 1}\\nline two"}'
+        )
+
+    def test_typed_params(self):
+        calls = self.parse(
+            '<｜DSML｜invoke name="f">\n'
+            '<｜DSML｜parameter name="flag" string="false">true</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="items" string="false">["x", "y"]</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="obj" string="false">{"k": 1}</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].function.arguments,
+            '{"flag": true, "items": ["x", "y"], "obj": {"k": 1}}',
+        )
+
+    def test_invalid_json_falls_back_to_string(self):
+        calls = self.parse(
+            '<｜DSML｜invoke name="f">\n'
+            '<｜DSML｜parameter name="a" string="false">not json</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+        self.assertEqual(calls[0].function.arguments, '{"a": "not json"}')
+
+    def test_parallel_calls(self):
+        calls = self.parse(
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="f">\n'
+            '<｜DSML｜parameter name="a" string="false">1</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="g">\n'
+            '<｜DSML｜parameter name="b" string="true">x</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].function.name, "f")
+        self.assertEqual(calls[0].function.arguments, '{"a": 1}')
+        self.assertEqual(calls[1].function.name, "g")
+        self.assertEqual(calls[1].function.arguments, '{"b": "x"}')
+
+    def test_no_args(self):
+        calls = self.parse('<｜DSML｜invoke name="list_files">\n</｜DSML｜invoke>')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "list_files")
+        self.assertEqual(calls[0].function.arguments, "{}")
+
+    def test_streamed_through_tag_parser(self):
+        from endpoints.OAI.utils.toolcall_formats.deepseek_v4 import (
+            TOOLCALL_START,
+            TOOLCALL_END,
+        )
+
+        p = TagStreamParser(
+            reasoning_start="<think>",
+            reasoning_end="</think>",
+            tool_start=TOOLCALL_START,
+            tool_end=TOOLCALL_END,
+            start_in_reasoning=True,
+        )
+        text = (
+            "pondering</think>Checking the weather.\n\n"
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="location" string="true">Tokyo</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+        # Feed in small chunks to exercise tag holdback
+        out = collect(p, [text[i : i + 7] for i in range(0, len(text), 7)])
+        self.assertEqual(out["reasoning"], "pondering")
+        self.assertEqual(out["content"].rstrip(), "Checking the weather.")
 
         calls = self.parse(out["tool"])
         self.assertEqual(len(calls), 1)

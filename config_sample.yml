@@ -49,6 +49,8 @@ logging:
   log_requests: false
 
   # Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).
+  # Also saves the fully templated prompt (the exact text sent to the tokenizer)
+  # as a .txt file with the same basename.
   # PRIVACY WARNING: Enabling this creates a comprehensive request log, including the
   # full message history and generation parameters. API keys are redacted, but prompts
   # and user-provided content are preserved for bug-report reproduction.
@@ -122,8 +124,25 @@ model:
   autosplit_reserve: [96]
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
-  # Used with tensor parallelism.
+  # Used both with and without tensor parallelism.
   gpu_split: []
+
+  # Number of mixture-of-expert layers to offload to CPU inference (default: 0)
+  # Only affects MoE models. Set a large value such as 999 to offload all layers
+  # Mutually exclusive with cpu_moe_split_experts.
+  cpu_moe_offload_layers:
+
+  # Number of routed experts per MoE layer to offload to CPU inference (default: 0).
+  # Unlike cpu_moe_offload_layers, this splits every MoE layer instead of offloading whole
+  # layers: the coldest experts are kept in system RAM and computed on the CPU, overlapping
+  # each layer's own GPU compute, with dynamic placement keeping hot experts in VRAM.
+  # Mutually exclusive with cpu_moe_offload_layers; not supported with tensor parallelism.
+  cpu_moe_split_experts:
+
+  # Worker thread count for CPU MoE inference (default: None).
+  # Applies to both cpu_moe_offload_layers and cpu_moe_split_experts. When unset,
+  # defers to the EXL3_MOE_CPU_THREADS environment variable, then half the CPU core count.
+  cpu_moe_threads:
 
   # NOTE: If a model has YaRN rope scaling, it will automatically be enabled by ExLlama.
   # rope_scale and rope_alpha settings won't apply in this case.
@@ -167,6 +186,11 @@ model:
   # Enables vision support if the model supports it. (default: False)
   vision: false
 
+  # Keep the vision model's weights in system RAM instead of VRAM (default: False).
+  # Weights are stored in pinned host memory and streamed to the GPU during inference,
+  # trading vision speed for VRAM. Only applies when vision is enabled.
+  vision_offload: false
+
   # Default chat template variables (default: {}).
   # Merged into the template variables of every chat completion request; values
   # sent by the client (template_vars / chat_template_kwargs, or the top-level
@@ -199,6 +223,20 @@ model:
   # If False, tool call tags inside a reasoning block are treated as plain reasoning text.
   tool_calls_in_reasoning: true
 
+  # Default reasoning token budget (default: None).
+  # When a request's reasoning content exceeds the budget, the server forces the end of
+  # the reasoning phase by injecting reasoning_budget_message followed by the model's
+  # end-of-reasoning tokens. 0 ends reasoning as soon as it starts; None or a negative
+  # value disables the budget. Overridable per request via reasoning_budget_tokens
+  # (aliases: reasoning_budget, thinking_budget, thinking_token_budget) or
+  # reasoning.max_tokens. Requires a reasoning format: reasoning tags, Harmony or Muse Glimmer.
+  reasoning_budget_tokens:
+
+  # Text injected before the end-of-reasoning tokens when the reasoning budget is
+  # exhausted (default: no text, only the end-of-reasoning tokens are forced). Also overridable
+  # per request via reasoning_budget_message.
+  reasoning_budget_message:
+
   # Tool format, e.g. 'qwen3_coder'. See docs for supported formats. If left blank,
   # tool calls from the model will not be parsed by the server.
   tool_format:
@@ -208,6 +246,12 @@ model:
   # to override. Setting 'tool_format: harmony' is equivalent to setting this to true.
   # When active, supersedes the reasoning and tool format settings.
   harmony:
+
+  # Parse responses in the Muse Glimmer message format.
+  # Auto-detected from the model's special tokens by default; set to true or false
+  # to override. Setting 'tool_format: muse_glimmer' is equivalent to setting this to true.
+  # When active, supersedes the reasoning and tool format settings.
+  muse_glimmer:
 
 # Options for draft models (speculative decoding)
 # This will use more VRAM!
@@ -248,6 +292,10 @@ draft_model:
   # This overhead multiplies with the max batch size, so for models with long drafts
   # (e.g. DFlash with 15 tokens by default) shorter drafts may be preferable.
   draft_num_tokens:
+
+  # Adjust number of draft tokens dynamically based on observed acceptance rates (default: False)
+  # Ceiling is given by num_draft_tokens.
+  dynamic_draft:
 
   # Minimum match length for exllamav3 n-gram drafting (default: 2).
   # Only used when draft_mode is ngram.
@@ -294,6 +342,9 @@ memory:
 
   # Max size of recurrent cache in system memory, in MB (default: 4096)
   sysmem_recurrent_cache: 4096
+
+  # Size of system memory second-tier K/V cache, in MB (default: 0)
+  sysmem_kv_cache: 0
 
   # Use cudaMallocAsync backend in Torch (default: True).
   # Enabling this is generally preferable, but it may cause issues with certain
